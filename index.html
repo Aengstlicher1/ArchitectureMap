@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supplier Map</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%233d6b7d'/%3E%3Cpath d='M32 12c-9.4 0-17 7.2-17 16.8C15 41.6 32 54 32 54s17-12.4 17-25.2C49 19.2 41.4 12 32 12z' fill='%23fdf6ec'/%3E%3Ccircle cx='32' cy='28' r='7' fill='%233d6b7d'/%3E%3C/svg%3E">
 <script src="./support.js"></script>
 </head>
 <body>
@@ -294,13 +296,14 @@ class Component extends DCLogic {
 
   _rebuildMarkers() {
     if (!this.map) return;
-    Object.values(this.markers).forEach(m => this.map.removeLayer(m));
-    Object.values(this.approxCircles || {}).forEach(c => this.map.removeLayer(c));
+    try { Object.values(this.markers).forEach(m => this.map.removeLayer(m)); } catch (e) {}
+    try { Object.values(this.approxCircles || {}).forEach(c => this.map.removeLayer(c)); } catch (e) {}
     this.markers = {};
     this.approxCircles = {};
     this.state.data.forEach(cat => {
       cat.items.forEach((it, idx) => {
-        if (!isFinite(it.lat) || !isFinite(it.lng)) return; // not geocoded yet
+        const valid = isFinite(it.lat) && isFinite(it.lng) && Math.abs(it.lat) <= 90 && Math.abs(it.lng) <= 180 && !(it.lat === 0 && it.lng === 0);
+        if (!valid) return; // not geocoded yet, or bad coordinates
         const k = cat.id + '::' + idx;
         const approx = !!it.approx;
         const m = L.circleMarker([it.lat, it.lng], {
@@ -364,6 +367,10 @@ class Component extends DCLogic {
 
   _syncMap() {
     if (!this.map) return;
+    try { this._syncMapInner(); } catch (e) { console.error('[syncMap]', e); }
+  }
+
+  _syncMapInner() {
     const search = this.state.searchTerm.trim().toLowerCase();
     this.state.data.forEach(cat => {
       cat.items.forEach((it, idx) => {
@@ -372,15 +379,17 @@ class Component extends DCLogic {
         if (!m) return;
         const match = !search || it.name.toLowerCase().includes(search);
         const show = cat.enabled && match;
-        const onMap = this.map.hasLayer(m);
-        if (show && !onMap) m.addTo(this.map);
-        else if (!show && onMap) this.map.removeLayer(m);
-        const circle = this.approxCircles[k];
-        if (circle) {
-          const cOn = this.map.hasLayer(circle);
-          if (show && !cOn) circle.addTo(this.map).bringToBack();
-          else if (!show && cOn) this.map.removeLayer(circle);
-        }
+        try {
+          const onMap = this.map.hasLayer(m);
+          if (show && !onMap) m.addTo(this.map);
+          else if (!show && onMap) this.map.removeLayer(m);
+          const circle = this.approxCircles[k];
+          if (circle) {
+            const cOn = this.map.hasLayer(circle);
+            if (show && !cOn) circle.addTo(this.map).bringToBack();
+            else if (!show && cOn) this.map.removeLayer(circle);
+          }
+        } catch (e) { console.error('[syncMap marker]', k, e); }
         const sel = !!this.state.selected[k];
         m.setStyle({
           radius: sel ? 9 : (it.approx ? 5.5 : 6),
@@ -493,48 +502,22 @@ class Component extends DCLogic {
 
   async refresh() {
     if (this.state.loading) return;
-    this.setState({ loading: true, lastSync: 'Re-parsing from Google Maps…' });
+    this._geocodeGen = (this._geocodeGen || 0) + 1;
+    this.setState({ loading: true, lastSync: 'Checking for updates…' });
     try {
-      const kmlUrl = 'https://www.google.com/maps/d/kml?mid=' + MID + '&forcekml=1';
-      const proxies = [
-        'https://api.allorigins.win/raw?url=' + encodeURIComponent(kmlUrl),
-        'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(kmlUrl),
-        'https://thingproxy.freeboard.io/fetch/' + kmlUrl,
-      ];
-      let text = null, lastErr = '';
-      for (const p of proxies) {
-        const host = (p.split('/')[2] || p);
-        try {
-          const ctrl = new AbortController();
-          const to = setTimeout(() => ctrl.abort(), 12000);
-          const r = await fetch(p, { signal: ctrl.signal });
-          const t = await r.text();
-          clearTimeout(to);
-          console.log('[re-parse]', host, '→ HTTP', r.status, '·', t.length, 'bytes', t.indexOf('<kml') !== -1 ? '· KML ✓' : '· no KML');
-          if (t && t.indexOf('<kml') !== -1) { text = t; break; }
-          lastErr = host + ' HTTP ' + r.status + ' (no KML in response)';
-        } catch (e) {
-          console.warn('[re-parse]', host, 'failed:', e.message);
-          lastErr = host + ': ' + (e.name === 'AbortError' ? 'timed out' : e.message);
-        }
-      }
-      if (!text) {
-        console.warn('[re-parse] all proxies failed. Last:', lastErr);
-        this.setState({ loading: false, data: [], selected: {}, lastSync: 'Could not reach Google Maps (' + lastErr + ')' }, () => { try { this._rebuildMarkers(); } catch (e) {} });
-        return;
-      }
-      let parsed = [];
-      try { parsed = this._parseKml(text); } catch (e) { parsed = []; }
-      if (!parsed.length) { this.setState({ loading: false, data: [], selected: {}, lastSync: 'No points found in the live map' }, () => { try { this._rebuildMarkers(); } catch (e) {} }); return; }
+      const res = await fetch('./data.json?_=' + Date.now());
+      if (!res.ok) throw new Error('data.json HTTP ' + res.status + ' — has the sync workflow run yet?');
+      const json = await res.json();
+      const parsed = json.categories || [];
+      if (!parsed.length) { this.setState({ loading: false, data: [], selected: {}, lastSync: 'data.json has no categories yet' }, () => { try { this._rebuildMarkers(); } catch (e) {} }); return; }
       const total = parsed.reduce((a, f) => a + f.items.length, 0);
       this.setState({
         data: buildCats(parsed),
         loading: false,
         selected: {},
-        lastSync: 'Live from Google Maps · ' + total + ' points',
+        lastSync: 'Synced ' + total + ' points · ' + (json.syncedAt ? new Date(json.syncedAt).toLocaleString() : ''),
       }, () => {
         try { this._rebuildMarkers(); } catch (e) {}
-        // repaint tiles + refit so the map never goes blank after a re-parse
         setTimeout(() => {
           if (!this.map) return;
           this.map.invalidateSize();
@@ -542,31 +525,36 @@ class Component extends DCLogic {
           this.state.data.forEach(c => c.items.forEach(it => {
             if (isFinite(it.lat) && isFinite(it.lng)) pts.push([it.lat, it.lng]);
           }));
-          if (pts.length) this.map.fitBounds(pts, { padding: [60, 60], paddingTopLeft: [380, 80] });
+          if (pts.length) this.map.fitBounds(pts, { padding: [60, 60], paddingTopLeft: [380, 80], animate: false });
         }, 60);
         this._geocodeMissing().catch(() => {});
       });
     } catch (e) {
-      this.setState({ loading: false, data: [], selected: {}, lastSync: 'Re-parse failed: ' + (e.message || e) }, () => { try { this._rebuildMarkers(); } catch (err) {} });
+      this.setState({ loading: false, data: [], selected: {}, lastSync: 'Could not load data.json: ' + (e.message || e) }, () => { try { this._rebuildMarkers(); } catch (err) {} });
     }
   }
 
   _parseKml(text) {
     const doc = new DOMParser().parseFromString(text, 'text/xml');
-    const folders = Array.from(doc.querySelectorAll('Document > Folder'));
+    const ln = (el, tag) => Array.from(el.children).filter(c => (c.localName || c.tagName).toLowerCase() === tag);
+    const allByTag = (root, tag) => Array.from(root.getElementsByTagName(tag)).length
+      ? Array.from(root.getElementsByTagName(tag))
+      : Array.from(root.getElementsByTagName('*')).filter(c => (c.localName || c.tagName).toLowerCase() === tag);
+    const folders = allByTag(doc, 'folder');
     return folders.map(f => {
-      const name = (f.querySelector(':scope > name') ? f.querySelector(':scope > name').textContent : '').trim();
-      const items = Array.from(f.querySelectorAll(':scope > Placemark')).map(pm => {
-        const nmEl = pm.querySelector(':scope > name');
+      const nameEl = ln(f, 'name')[0];
+      const name = (nameEl ? nameEl.textContent : '').trim();
+      const items = ln(f, 'placemark').map(pm => {
+        const nmEl = ln(pm, 'name')[0];
         const nm = (nmEl ? nmEl.textContent : '').trim();
-        const cEl = pm.querySelector('Point > coordinates');
-        const coord = (cEl ? cEl.textContent : '').trim();
+        const coordEls = allByTag(pm, 'coordinates');
+        const coord = (coordEls[0] ? coordEls[0].textContent : '').trim();
         if (coord) {
-          const parts = coord.split(',').map(Number);
+          const parts = coord.split(',').map(s => Number(s.trim()));
           if (isFinite(parts[1]) && isFinite(parts[0])) return { name: nm, lat: parts[1], lng: parts[0] };
         }
         // address-only placemark → geocode later
-        const adEl = pm.querySelector(':scope > address');
+        const adEl = ln(pm, 'address')[0];
         const address = (adEl ? adEl.textContent : '').trim();
         if (address) return { name: nm, lat: undefined, lng: undefined, approx: true, address };
         return null;
@@ -617,9 +605,10 @@ class Component extends DCLogic {
   }
 
   async _geocodeMissing() {
+    const gen = this._geocodeGen = (this._geocodeGen || 0) + 1;
     const jobs = [];
     this.state.data.forEach((cat, ci) => cat.items.forEach((it, ii) => {
-      if (it.approx && (!isFinite(it.lat) || !isFinite(it.lng))) jobs.push({ ci, ii, it });
+      if (it.approx && (!isFinite(it.lat) || !isFinite(it.lng))) jobs.push({ ci, id: cat.id, ii, name: it.name, it });
     }));
     if (!jobs.length) return;
     this.setState({ lastSync: 'Geocoding ' + jobs.length + ' address-only entries…' });
@@ -627,10 +616,11 @@ class Component extends DCLogic {
     for (const j of jobs) {
       const res = await this._geocode(j.it.name, j.it.address);
       done++;
-      if (res) {
+      if (res && this._geocodeGen === gen) {
         this.setState(s => {
-          const data = s.data.map((c, ci) => ci !== j.ci ? c : {
-            ...c, items: c.items.map((it, ii) => ii !== j.ii ? it : { ...it, lat: res.lat, lng: res.lng }),
+          const data = s.data.map((c, ci) => {
+            if (ci !== j.ci || c.id !== j.id) return c;
+            return { ...c, items: c.items.map((it, ii) => (ii !== j.ii || it.name !== j.name) ? it : { ...it, lat: res.lat, lng: res.lng }) };
           });
           return { data };
         }, () => this._rebuildMarkers());
