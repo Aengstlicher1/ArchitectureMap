@@ -164,7 +164,7 @@ function svgIcon(name, size, color, extraStyle) {
 }
 
 
-function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
+function slug(s) { return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
 
 const PRESETS = ['#b2622d','#c67139','#c2903a','#7a8a5e','#728157','#4f7d8c','#3d6b7d','#8c4f6b','#6b4f8c','#b23d3d','#2f7d4f','#201e1d'];
 
@@ -641,6 +641,22 @@ class Component extends DCLogic {
   }
 
   renderVals() {
+    try {
+      return this._renderVals();
+    } catch (e) {
+      console.error('[render crash]', e);
+      return {
+        searchTerm: '', onSearchChange: () => {}, hasSearch: false, clearSearch: () => {},
+        sidebarOpen: true, sidebarIconEl: null, searchIconEl: null, clearIconEl: null,
+        refreshIconEl: null, routeIconEl: null, toggleSidebar: () => {},
+        sidebarWrapStyle: 'position:absolute; top:88px; bottom:20px; left:20px; width:340px; background:var(--color-neutral-100); border-radius:var(--radius-lg); box-shadow:var(--shadow-lg); z-index:1000; padding:16px; font-size:13px; color:#b23d3d;',
+        refreshIconStyle: '', refresh: () => this.refresh(), totalLabel: '', statusText: 'Render error: ' + (e.message || e),
+        categories: [], hasSelection: false, selectionLabel: '', clearSelection: () => {}, planRoute: () => {},
+      };
+    }
+  }
+
+  _renderVals() {
     const search = this.state.searchTerm.trim().toLowerCase();
 
     const categories = this.state.data.map(cat => {
