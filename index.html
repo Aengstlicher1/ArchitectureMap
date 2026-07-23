@@ -257,14 +257,16 @@ class Component extends DCLogic {
 
   componentDidMount() {
     this.markers = {};
-    this.approxCircles = {};
-    this._closeTimers = {};
     this._waitForLeaflet();
     this.refresh(); // LiveOnly: always pull fresh data on load, no bundled backup
   }
 
   componentDidUpdate() {
     this._syncMap();
+  }
+
+  componentWillUnmount() {
+    if (this._outsideClickCloser) document.removeEventListener('pointerdown', this._outsideClickCloser, true);
   }
 
   _waitForLeaflet(tries) {
@@ -279,7 +281,14 @@ class Component extends DCLogic {
   _initMap() {
     if (this.map) return;
     const el = document.getElementById('supplier-map');
-    this.map = L.map(el, { zoomControl: true, attributionControl: true }).setView([35.905, 14.42], 11);
+    this.map = L.map(el, { zoomControl: true, attributionControl: true, tap: false });
+    this.map.setView([35.905, 14.42], 11);
+    this._outsideClickCloser = (e) => {
+      const t = e.target;
+      if (t && t.closest && (t.closest('.leaflet-marker-icon') || t.closest('.leaflet-popup'))) return;
+      if (this.map) this.map.closePopup();
+    };
+    document.addEventListener('pointerdown', this._outsideClickCloser, true);
     L.control.zoom({ position: 'bottomright' }).addTo(this.map);
     this.map.zoomControl && this.map.removeControl(this.map.zoomControl);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
@@ -294,67 +303,60 @@ class Component extends DCLogic {
     setTimeout(() => this.map && this.map.invalidateSize(), 200);
   }
 
+  _dotIcon(color, approx, selected) {
+    const size = approx ? 12 : 12;
+    const border = approx ? 'dashed' : 'solid';
+    return L.divIcon({
+      className: '',
+      html: `<div class="dot-marker" data-approx="${approx ? 1 : 0}" data-color="${color}" style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:1.5px ${border} #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.18);transition:box-shadow .1s ease;"></div>`,
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+      popupAnchor: [0, -size / 2],
+    });
+  }
+
+  _applyMarkerSelectionStyle(m, color, selected) {
+    const el = m.getElement && m.getElement();
+    const dot = el && el.firstElementChild;
+    if (!dot) return;
+    dot.style.boxShadow = selected ? `0 0 0 3px #201e1d, 0 0 0 5px rgba(0,0,0,0.18)` : '0 0 0 1px rgba(0,0,0,0.18)';
+    dot.style.transform = selected ? 'scale(1.4)' : 'scale(1)';
+  }
+
   _rebuildMarkers() {
     if (!this.map) return;
     try { Object.values(this.markers).forEach(m => this.map.removeLayer(m)); } catch (e) {}
-    try { Object.values(this.approxCircles || {}).forEach(c => this.map.removeLayer(c)); } catch (e) {}
     this.markers = {};
-    this.approxCircles = {};
     this.state.data.forEach(cat => {
       cat.items.forEach((it, idx) => {
         const valid = isFinite(it.lat) && isFinite(it.lng) && Math.abs(it.lat) <= 90 && Math.abs(it.lng) <= 180 && !(it.lat === 0 && it.lng === 0);
         if (!valid) return; // not geocoded yet, or bad coordinates
         const k = cat.id + '::' + idx;
         const approx = !!it.approx;
-        const m = L.circleMarker([it.lat, it.lng], {
-          radius: approx ? 5.5 : 6,
-          fillColor: cat.color,
-          color: '#fff',
-          weight: 1.5,
-          fillOpacity: approx ? 0.55 : 0.95,
-          dashArray: approx ? '2 2' : null,
-        });
+        const m = L.marker([it.lat, it.lng], { icon: this._dotIcon(cat.color, approx, false) });
         const esc = s => (s || '').replace(/</g, '&lt;');
         let html = '<strong>' + esc(it.name) + '</strong><br>' + esc(cat.name);
         if (approx) {
           html += '<br><span style="color:#b06a2c;font-size:11px;">≈ Approximate — geocoded from address</span>';
           if (it.address) html += '<br><span style="color:#6b625a;font-size:11px;">' + esc(it.address) + '</span>';
-          const circle = L.circle([it.lat, it.lng], {
-            radius: 250, color: cat.color, weight: 1,
-            opacity: 0.28, fillColor: cat.color, fillOpacity: 0.06, interactive: false,
-          });
-          this.approxCircles[k] = circle;
         }
-        m.bindPopup(html, { closeButton: false, autoClose: false, closeOnClick: false });
-        m.on('mouseover', () => { this._cancelClose(m); m.openPopup(); });
-        m.on('mouseout', (e) => {
-          const toEl = e.originalEvent && e.originalEvent.relatedTarget;
-          const popEl = m.getPopup() && m.getPopup().getElement();
-          if (popEl && toEl && popEl.contains(toEl)) return; // moving onto the popup
-          this._scheduleClose(m);
+        m.bindPopup(html, { closeButton: false, autoClose: true, closeOnClick: true });
+        m.off('click'); // Leaflet's own bindPopup click-to-open listener has no position guard; replace it
+        m.on('click', (e) => {
+          const iconEl = m.getElement();
+          if (iconEl) {
+            const r = iconEl.getBoundingClientRect();
+            const oe = e.originalEvent;
+            const cx = oe ? oe.clientX : null, cy = oe ? oe.clientY : null;
+            if (cx == null || cx < r.left - 4 || cx > r.right + 4 || cy < r.top - 4 || cy > r.bottom + 4) return;
+          }
+          m.togglePopup();
+          this._selectFromMap(k);
         });
-        m.on('popupopen', (e) => {
-          const popEl = e.popup.getElement();
-          if (!popEl) return;
-          popEl.addEventListener('mouseenter', () => this._cancelClose(m));
-          popEl.addEventListener('mouseleave', () => this._scheduleClose(m));
-        });
-        m.on('click', () => this._selectFromMap(k));
         this.markers[k] = m;
       });
     });
     this._syncMap();
-  }
-
-  _scheduleClose(m) {
-    const id = m._leaflet_id;
-    if (this._closeTimers[id]) clearTimeout(this._closeTimers[id]);
-    this._closeTimers[id] = setTimeout(() => m.closePopup(), 220);
-  }
-
-  _cancelClose(m) {
-    const id = m._leaflet_id;
-    if (this._closeTimers[id]) clearTimeout(this._closeTimers[id]);
   }
 
   _selectFromMap(k) {
@@ -367,7 +369,7 @@ class Component extends DCLogic {
 
   _syncMap() {
     if (!this.map) return;
-    try { this._syncMapInner(); } catch (e) { console.error('[syncMap]', e); }
+    try { this._syncMapInner(); } catch (e) { console.error('[syncMap]', e && (e.stack || e.message) || e); }
   }
 
   _syncMapInner() {
@@ -383,21 +385,11 @@ class Component extends DCLogic {
           const onMap = this.map.hasLayer(m);
           if (show && !onMap) m.addTo(this.map);
           else if (!show && onMap) this.map.removeLayer(m);
-          const circle = this.approxCircles[k];
-          if (circle) {
-            const cOn = this.map.hasLayer(circle);
-            if (show && !cOn) circle.addTo(this.map).bringToBack();
-            else if (!show && cOn) this.map.removeLayer(circle);
-          }
-        } catch (e) { console.error('[syncMap marker]', k, e); }
+        } catch (e) { console.error('[syncMap marker]', k, e && (e.stack || e.message) || e); }
         const sel = !!this.state.selected[k];
-        m.setStyle({
-          radius: sel ? 9 : (it.approx ? 5.5 : 6),
-          weight: sel ? 3 : 1.5,
-          color: sel ? '#201e1d' : '#fff',
-          fillOpacity: sel ? 1 : (it.approx ? 0.55 : 0.95),
-        });
-        if (sel) m.bringToFront();
+        this._applyMarkerSelectionStyle(m, cat.color, sel);
+        if (sel && m.setZIndexOffset) m.setZIndexOffset(1000);
+        else if (m.setZIndexOffset) m.setZIndexOffset(0);
       });
     });
   }
@@ -450,9 +442,11 @@ class Component extends DCLogic {
     cat.items.forEach((it, idx) => {
       const k = id + '::' + idx;
       const m = this.markers[k];
-      if (m) m.setStyle({ fillColor: color });
-      const circle = this.approxCircles[k];
-      if (circle) circle.setStyle({ color, fillColor: color });
+      if (m) {
+        const el = m.getElement();
+        const dot = el && el.firstElementChild;
+        if (dot) dot.style.background = color;
+      }
     });
   }
 
