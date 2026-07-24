@@ -246,7 +246,7 @@ function buildCats(raw) {
 class Component extends DCLogic {
   state = {
     searchTerm: '',
-    sidebarOpen: true,
+    sidebarOpen: false,
     selected: {},
     loading: false,
     lastSync: 'Loading live data from Google Maps…',
@@ -281,7 +281,19 @@ class Component extends DCLogic {
   _initMap() {
     if (this.map) return;
     const el = document.getElementById('supplier-map');
-    this.map = L.map(el, { zoomControl: true, attributionControl: true, tap: false });
+    this.map = L.map(el, { zoomControl: true, attributionControl: true, tap: false, minZoom: 3, worldCopyJump: true, inertia: false });
+    this._latGuard = () => {
+      if (!this.map || this._clampingLat) return;
+      const MAX_LAT = 85;
+      const c = this.map.getCenter();
+      if (c.lat > MAX_LAT || c.lat < -MAX_LAT) {
+        const lat = Math.min(Math.max(c.lat, -MAX_LAT), MAX_LAT);
+        this._clampingLat = true;
+        this.map.setView([lat, c.lng], this.map.getZoom(), { animate: false });
+        this._clampingLat = false;
+      }
+    };
+    this.map.on('drag move zoomend', this._latGuard);
     this.map.setView([35.905, 14.42], 11);
     this._outsideClickCloser = (e) => {
       const t = e.target;
@@ -300,15 +312,44 @@ class Component extends DCLogic {
     const pts = [];
     this.state.data.forEach(c => c.items.forEach(it => pts.push([it.lat, it.lng])));
     if (pts.length) this.map.fitBounds(pts, { padding: [60, 60], paddingTopLeft: [380, 80] });
-    setTimeout(() => this.map && this.map.invalidateSize(), 200);
+    setTimeout(() => { this.map && this.map.invalidateSize(); this._applyMinZoom(); }, 200);
+  }
+
+  _applyMinZoom() {
+    if (!this.map) return;
+    try {
+      const pts = [];
+      this.state.data.forEach(c => c.items.forEach(it => {
+        if (isFinite(it.lat) && isFinite(it.lng)) pts.push([it.lat, it.lng]);
+      }));
+      if (pts.length < 2) { this.map.setMinZoom(3); return; }
+      const lats = pts.map(p => p[0]), lngs = pts.map(p => p[1]);
+      const bounds = L.latLngBounds([Math.min(...lats), Math.min(...lngs)], [Math.max(...lats), Math.max(...lngs)]);
+      let fitZoom;
+      try { fitZoom = this.map.getBoundsZoom(bounds, false); } catch (e) { fitZoom = null; }
+      this.map.setMinZoom(isFinite(fitZoom) ? Math.max(2, fitZoom - 2) : 3);
+    } catch (e) { console.error('[applyMinZoom]', e && (e.stack || e.message) || e); }
   }
 
   _dotIcon(color, approx, selected) {
-    const size = approx ? 12 : 12;
-    const border = approx ? 'dashed' : 'solid';
+    const size = 12;
+    if (approx) {
+      const ring = 28;
+      const off = (ring - size) / 2;
+      return L.divIcon({
+        className: '',
+        html: `<div style="position:relative;width:${ring}px;height:${ring}px;">` +
+          `<div style="position:absolute;inset:0;border-radius:50%;border:1.5px dashed ${color};opacity:0.65;"></div>` +
+          `<div class="dot-marker" data-approx="1" data-color="${color}" style="position:absolute;left:${off}px;top:${off}px;width:${size}px;height:${size}px;border-radius:50%;background:${color};border:1.5px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.18);transition:box-shadow .1s ease;"></div>` +
+          `</div>`,
+        iconSize: [ring, ring],
+        iconAnchor: [ring / 2, ring / 2],
+        popupAnchor: [0, -ring / 2],
+      });
+    }
     return L.divIcon({
       className: '',
-      html: `<div class="dot-marker" data-approx="${approx ? 1 : 0}" data-color="${color}" style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:1.5px ${border} #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.18);transition:box-shadow .1s ease;"></div>`,
+      html: `<div class="dot-marker" data-approx="0" data-color="${color}" style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:1.5px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.18);transition:box-shadow .1s ease;"></div>`,
       iconSize: [size, size],
       iconAnchor: [size / 2, size / 2],
       popupAnchor: [0, -size / 2],
@@ -317,7 +358,8 @@ class Component extends DCLogic {
 
   _applyMarkerSelectionStyle(m, color, selected) {
     const el = m.getElement && m.getElement();
-    const dot = el && el.firstElementChild;
+    let dot = el && el.querySelector && el.querySelector('.dot-marker');
+    if (!dot) dot = el && el.firstElementChild;
     if (!dot) return;
     dot.style.boxShadow = selected ? `0 0 0 3px #201e1d, 0 0 0 5px rgba(0,0,0,0.18)` : '0 0 0 1px rgba(0,0,0,0.18)';
     dot.style.transform = selected ? 'scale(1.4)' : 'scale(1)';
@@ -520,6 +562,7 @@ class Component extends DCLogic {
             if (isFinite(it.lat) && isFinite(it.lng)) pts.push([it.lat, it.lng]);
           }));
           if (pts.length) this.map.fitBounds(pts, { padding: [60, 60], paddingTopLeft: [380, 80], animate: false });
+          this._applyMinZoom();
         }, 60);
         this._geocodeMissing().catch(() => {});
       });
